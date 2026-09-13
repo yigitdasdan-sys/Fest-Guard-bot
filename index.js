@@ -1,133 +1,189 @@
-require('dotenv').config();
-const { Client, GatewayIntentBits, AuditLogEvent, PermissionFlagsBits, ChannelType } = require('discord.js');
-const { joinVoiceChannel } = require('@discordjs/voice'); // Ses kanalında 7/24 kalmak için
+const { Client, GatewayIntentBits, AuditLogEvent, EmbedBuilder, PermissionsBitField } = require('discord.js');
 
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
-        GatewayIntentBits.GuildModeration,
+        GatewayIntentBits.GuildMembers,
+        GatewayIntentBits.GuildBans,
         GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.MessageContent,
-        GatewayIntentBits.GuildVoiceStates
+        GatewayIntentBits.MessageContent
     ]
 });
 
-// Ayarlar ve ID'ler
+// --- AYARLAR ---
 const CONFIG = {
-    logChannelId: '1548383428930441258', // Logların düşeceği kanal
-    voiceChannelId: '1547915520303435816', // Botun 7/24 duracağı ses kanalı
-    bypassRoleId: '1547917093058641961', // Bu role sahip kişilere işlem yapılmaz ve banlanmaz
+    TOKEN: "TOKEN_BURAYA",
+    LOG_CHANNEL_ID: "LOG_KANAL_ID_BURAYA", // Logların atılacağı kanal ID'si
+    MUAF_ROL_ID: "1547917093058641961", // Sadece bu rol ve sunucu sahibi korumalardan muaf olacak
 };
 
-// Spam takibi için hafıza
-const messageTracker = new Map();
-
-client.once('ready', async () => {
-    console.log(`Guard Bot Aktif: ${client.user.tag}`);
-
-    // Ses Kanalına 7/24 Girme İşlemi
-    try {
-        const guild = client.guilds.cache.first();
-        if (guild) {
-            const channel = await guild.channels.fetch(CONFIG.voiceChannelId);
-            if (channel && channel.type === ChannelType.GuildVoice) {
-                joinVoiceChannel({
-                    channelId: channel.id,
-                    guildId: guild.id,
-                    adapterCreator: guild.voiceAdapterCreator,
-                    selfDeaf: true,
-                    selfMute: true
-                });
-                console.log(`[SES] 7/24 ses kanalına giriş yapıldı: ${channel.name}`);
-            }
-        }
-    } catch (err) {
-        console.error('Ses kanalına bağlanırken hata oluştu:', err);
-    }
+client.once('ready', () => {
+    console.log(`[GUARD] ${client.user.tag} aktif ve katı koruma modu devrede!`);
 });
 
-// Log gönderme fonksiyonu
-async function sendLog(guild, description) {
+// Log Gönderme Yardımcı Fonksiyonu
+async function sendLog(guild, title, description, color = 0xFF0000) {
     try {
-        const logChannel = await guild.channels.fetch(CONFIG.logChannelId);
-        if (logChannel) {
-            await logChannel.send({ content: `🛡️ **GUARD LOG:**\n${description}` });
-        }
+        const logChannel = guild.channels.cache.get(CONFIG.LOG_CHANNEL_ID);
+        if (!logChannel) return;
+
+        const embed = new EmbedBuilder()
+            .setTitle(`🛡️ Sıkı Guard Bot - ${title}`)
+            .setDescription(description)
+            .setColor(color)
+            .setTimestamp();
+
+        await logChannel.send({ embeds: [embed] });
     } catch (err) {
-        console.error('Log gönderilemedi:', err);
+        console.error("Log gönderilemedi:", err);
     }
 }
 
-// 1. REKLAM VE SPAM KORUMASI
-client.on('messageCreate', async (message) => {
-    if (message.author.bot || !message.guild) return;
+// Muafiyet Kontrolü (Sadece sunucu sahibi ve muaf rol)
+function isMuaf(member) {
+    if (!member) return false;
+    if (member.id === member.guild.ownerId) return true;
+    return member.roles.cache.has(CONFIG.MUAF_ROL_ID);
+}
 
-    const member = message.member;
-    // Özel rolü olanlara veya yöneticilere dokunma
-    if (member.roles.cache.has(CONFIG.bypassRoleId) || member.permissions.has(PermissionFlagsBits.Administrator)) {
-        return;
+// Yetkiliyi Cezalandırma ve Yetkilerini Alma Fonksiyonu
+async function punishUnauthorizedUser(member, actionName) {
+    try {
+        // Tüm tehlikeli/yönetici rollerini al
+        const adminRoles = member.roles.cache.filter(r => r.permissions.has(PermissionsBitField.Flags.Administrator) || r.permissions.has(PermissionsBitField.Flags.BanMembers) || r.permissions.has(PermissionsBitField.Flags.KickMembers));
+        if (adminRoles.size > 0) {
+            await member.roles.remove(adminRoles).catch(() => {});
+        }
+        // Sunucudan at
+        await member.kick(`İzinsiz işlem (${actionName}) - Sıkı Guard Koruması`);
+    } catch (e) {
+        console.error("Cezalandırma hatası:", e);
     }
+}
 
-    // Reklam Koruması
-    const inviteRegex = /(discord\.(gg|io|me|li)|discordapp\.com\/invite)\/[^\s]+/gi;
-    if (inviteRegex.test(message.content)) {
-        await message.delete().catch(() => {});
-        const warn = await message.channel.send(`${message.author}, bu sunucuda reklam yapmak yasaktır!`);
-        setTimeout(() => warn.delete().catch(() => {}), 5000);
-        sendLog(message.guild, `${message.author.tag} (${message.author.id}) reklam yaptığı için mesajı silindi.`);
-        return;
-    }
+// 1. Anti-Bot Koruması (İzinsiz Bot Eklenmesi)
+client.on('guildMemberAdd', async (member) => {
+    if (!member.user.bot) return;
 
-    // Spam Koruması (Kısa sürede çok mesaj)
-    const userId = message.author.id;
-    const now = Date.now();
-    if (!messageTracker.has(userId)) {
-        messageTracker.set(userId, []);
-    }
+    const fetchedLogs = await member.guild.fetchAuditLogs({
+        limit: 1,
+        type: AuditLogEvent.BotAdd,
+    });
+    const botAddLog = fetchedLogs.entries.first();
+    if (!botAddLog) return;
 
-    const userTimestamps = messageTracker.get(userId);
-    userTimestamps.push(now);
+    const { executor } = botAddLog;
+    const executorMember = await member.guild.members.fetch(executor.id).catch(() => null);
 
-    // Son 5 saniyedeki mesajları filtrele
-    const recentMessages = userTimestamps.filter(time => now - time < 5000);
-    messageTracker.set(userId, recentMessages);
-
-    // Eğer 5 saniyede 5'ten fazla mesaj atarsa spam say ve 1 saat zaman aşımı ver
-    if (recentMessages.length >= 5) {
-        messageTracker.delete(userId);
+    if (!isMuaf(executorMember)) {
         try {
-            await member.timeout(60 * 60 * 1000, 'Spam yaptığı için otomatik zaman aşımı.');
-            await message.channel.send(`${message.author}, spam yaptığın için 1 saat süreyle susturuldun!`);
-            sendLog(message.guild, `${message.author.tag} (${message.author.id}) spam yaptığı için **1 saat** zaman aşımı aldı.`);
-        } catch (err) {
-            console.error('Timeout verilemedi:', err);
+            await member.kick("İzinsiz bot eklendi - Guard Koruması");
+            await punishUnauthorizedUser(executorMember, "Bot Ekleme");
+            
+            sendLog(
+                member.guild,
+                "İzinsiz Bot Engellendi!",
+                `**Eklenen Bot:** ${member.user.tag}\n**İzinsiz Ekleyen Yetkili:** ${executor.tag} (Sunucudan atıldı ve yetkileri alındı).`
+            );
+        } catch (e) {
+            console.error("Anti-bot işlem hatası:", e);
         }
     }
 });
 
-// 2. KANAL SİLME KORUMASI & ÖZEL ROLÜ KORUMA
+// 2. Anti-Ban Koruması (Muaf rol haricinde kim ban atarsa atılsın)
+client.on('guildBanAdd', async (ban) => {
+    const fetchedLogs = await ban.guild.fetchAuditLogs({
+        limit: 1,
+        type: AuditLogEvent.MemberBanAdd,
+    });
+    const banLog = fetchedLogs.entries.first();
+    if (!banLog) return;
+
+    const { executor } = banLog;
+    const executorMember = await ban.guild.members.fetch(executor.id).catch(() => null);
+    if (!executorMember) return;
+
+    if (!isMuaf(executorMember)) {
+        await punishUnauthorizedUser(executorMember, "Üye Yasaklama (Ban)");
+        sendLog(
+            ban.guild,
+            "İzinsiz Ban İşlemi Engellendi!",
+            `**Ban Atan Yetkili:** ${executor.tag}\n**Durum:** Muaf listede olmadığı için sunucudan atıldı ve yetkileri söküldü.`
+        );
+    }
+});
+
+// 3. Anti-Kick Koruması (Muaf rol haricinde kim üye atarsa atılsın)
+client.on('guildMemberRemove', async (member) => {
+    const fetchedLogs = await member.guild.fetchAuditLogs({
+        limit: 1,
+        type: AuditLogEvent.MemberKick,
+    });
+    const kickLog = fetchedLogs.entries.first();
+    if (!kickLog) return;
+
+    // Log zamanını kontrol et (eski loglarla karışmaması için güncel olmalı)
+    const { executor, target } = kickLog;
+    if (target.id !== member.id) return;
+
+    const executorMember = await member.guild.members.fetch(executor.id).catch(() => null);
+    if (!executorMember) return;
+
+    if (!isMuaf(executorMember)) {
+        await punishUnauthorizedUser(executorMember, "Üye Atma (Kick)");
+        sendLog(
+            member.guild,
+            "İzinsiz Kick İşlemi Engellendi!",
+            `**Kick Atan Yetkili:** ${executor.tag}\n**Durum:** Muaf listede olmadığı için sunucudan atıldı ve yetkileri söküldü.`
+        );
+    }
+});
+
+// 4. Kanal Koruma (İzinsiz Kanal Silme)
 client.on('channelDelete', async (channel) => {
-    const auditLogs = await channel.guild.fetchAuditLogs({
+    const fetchedLogs = await channel.guild.fetchAuditLogs({
         limit: 1,
         type: AuditLogEvent.ChannelDelete,
     });
-    const entry = auditLogs.entries.first();
-    if (!entry) return;
+    const deleteLog = fetchedLogs.entries.first();
+    if (!deleteLog) return;
 
-    const { executor } = entry;
-    if (executor.id === client.user.id) return;
+    const { executor } = deleteLog;
+    const executorMember = await channel.guild.members.fetch(executor.id).catch(() => null);
+    if (!executorMember) return;
 
-    const member = await channel.guild.members.fetch(executor.id).catch(() => null);
-    if (!member) return;
-
-    // Özel rolü varsa veya adminse işlem yapma
-    if (member.roles.cache.has(CONFIG.bypassRoleId) || member.permissions.has(PermissionFlagsBits.Administrator)) {
-        return;
+    if (!isMuaf(executorMember)) {
+        await punishUnauthorizedUser(executorMember, "Kanal Silme");
+        sendLog(
+            channel.guild,
+            "Kanal Silme Koruması Devrede!",
+            `**Silinen Kanal:** ${channel.name}\n**Silen Yetkili:** ${executor.tag} (Muaf olmadığından atıldı ve yetkileri alındı).`
+        );
     }
-
-    // Kanalı izinsiz silen kişinin yetkilerini al
-    await member.roles.set([]).catch(console.error);
-    sendLog(channel.guild, `🚨 ${executor.tag} izinsiz kanal sildiği için tüm rolleri alındı! Kanal: **${channel.name}**`);
 });
 
-client.login(process.env.TOKEN);
+// 5. Rol Koruma (İzinsiz Rol Silme)
+client.on('roleDelete', async (role) => {
+    const fetchedLogs = await role.guild.fetchAuditLogs({
+        limit: 1,
+        type: AuditLogEvent.RoleDelete,
+    });
+    const deleteLog = fetchedLogs.entries.first();
+    if (!deleteLog) return;
+
+    const { executor } = deleteLog;
+    const executorMember = await role.guild.members.fetch(executor.id).catch(() => null);
+    if (!executorMember) return;
+
+    if (!isMuaf(executorMember)) {
+        await punishUnauthorizedUser(executorMember, "Rol Silme");
+        sendLog(
+            role.guild,
+            "Rol Silme Koruması Devrede!",
+            `**Silinen Rol:** ${role.name}\n**Silen Yetkili:** ${executor.tag} (Muaf olmadığından atıldı ve yetkileri alındı).`
+        );
+    }
+});
+
+client.login(CONFIG.TOKEN);
